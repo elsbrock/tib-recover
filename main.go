@@ -391,6 +391,7 @@ func walkSnapshot(
 	outputLimit int64,
 	onEntry func(snapshotEntry) error,
 	openPayload func(snapshotEntry) (*payloadTarget, error),
+	knownEntries map[string]snapshotEntry,
 ) (int, error) {
 	chain, err := newVolumeChainReader(volumes, startVolume)
 	if err != nil {
@@ -455,13 +456,9 @@ func walkSnapshot(
 				return chain.index, fmt.Errorf("decode path field at %#x: %w", start, err)
 			}
 			depth := int(path.depth)
-			if depth > len(components) {
-				return chain.index, fmt.Errorf(
-					"path depth jumps from %d to %d at %#x",
-					len(components),
-					depth,
-					start,
-				)
+			components, err = resolveInheritedPath(components, path, knownEntries)
+			if err != nil {
+				return chain.index, fmt.Errorf("resolve path field at %#x: %w", start, err)
 			}
 			components = append(components[:depth], path.name)
 			current = snapshotEntry{
@@ -477,6 +474,83 @@ func walkSnapshot(
 			return chain.index, nil
 		}
 	}
+}
+
+func entryKey(components []string) string {
+	return strings.Join(components, "\x00")
+}
+
+func hasComponentPrefix(components, prefix []string) bool {
+	if len(components) < len(prefix) {
+		return false
+	}
+	return slices.Equal(components[:len(prefix)], prefix)
+}
+
+func resolveInheritedPath(
+	current []string,
+	path pathField,
+	knownEntries map[string]snapshotEntry,
+) ([]string, error) {
+	depth := int(path.depth)
+	if len(knownEntries) == 0 {
+		if depth <= len(current) {
+			return current, nil
+		}
+		return nil, fmt.Errorf("path depth jumps from %d to %d", len(current), depth)
+	}
+
+	var exact []snapshotEntry
+	for _, candidate := range knownEntries {
+		if len(candidate.components) == depth+1 &&
+			candidate.kind == path.kind &&
+			candidate.components[depth] == path.name {
+			exact = append(exact, candidate)
+		}
+	}
+	if len(exact) == 1 {
+		return slices.Clone(exact[0].components[:depth]), nil
+	}
+	if depth <= len(current) {
+		proposed := append(slices.Clone(current[:depth]), path.name)
+		if candidate, ok := knownEntries[entryKey(proposed)]; ok && candidate.kind == path.kind {
+			return current, nil
+		}
+	}
+	if len(exact) > 1 {
+		if depth <= len(current) {
+			return current, nil
+		}
+		return nil, fmt.Errorf(
+			"path depth jumps from %d to %d and %d inherited paths match %q",
+			len(current),
+			depth,
+			len(exact),
+			path.name,
+		)
+	}
+	if depth <= len(current) {
+		return current, nil
+	}
+
+	var parents []snapshotEntry
+	for _, candidate := range knownEntries {
+		if len(candidate.components) == depth &&
+			candidate.kind == 1 &&
+			hasComponentPrefix(candidate.components, current) {
+			parents = append(parents, candidate)
+		}
+	}
+	if len(parents) == 1 {
+		return slices.Clone(parents[0].components), nil
+	}
+	return nil, fmt.Errorf(
+		"path depth jumps from %d to %d; found %d matching inherited parents for %q",
+		len(current),
+		depth,
+		len(parents),
+		path.name,
+	)
 }
 
 func decodePathField(data []byte) (pathField, error) {
@@ -655,12 +729,37 @@ func recordsCommand(arguments []string) error {
 	reader := newCountingReader(file, legacyHeaderSize)
 	fmt.Printf("volume=%d path=%s\n", candidate.sequence, candidate.path)
 	for index := 0; index < *limit; index++ {
-		value, err := readField(reader, *maxOutput)
+		start := reader.offset
+		tag, err := reader.ReadByte()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return fmt.Errorf("field %d: %w", index+1, err)
+		}
+
+		var dumpFile *os.File
+		if *dumpField == index+1 {
+			if *dumpOutput == "" {
+				return errors.New("--dump-field requires --dump-output")
+			}
+			dumpFile, err = os.OpenFile(*dumpOutput, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+		}
+		var dumpWriter io.Writer
+		if dumpFile != nil {
+			dumpWriter = dumpFile
+		}
+		value, readErr := readFieldBody(reader, start, tag, *maxOutput, dumpWriter)
+		if dumpFile != nil {
+			if closeErr := dumpFile.Close(); readErr == nil {
+				readErr = closeErr
+			}
+		}
+		if readErr != nil {
+			return fmt.Errorf("field %d: %w", index+1, readErr)
 		}
 
 		description := ""
@@ -706,21 +805,6 @@ func recordsCommand(arguments []string) error {
 				strings.ToUpper(hex.EncodeToString(value.prefix[:min(len(value.prefix), 16)])),
 			)
 		}
-		if *dumpField == index+1 {
-			if *dumpOutput == "" {
-				return errors.New("--dump-field requires --dump-output")
-			}
-			if int64(len(value.prefix)) != value.decompressedSize {
-				return fmt.Errorf(
-					"field %d is larger than the %d-byte dump limit",
-					index+1,
-					maxFieldPrefix,
-				)
-			}
-			if err := os.WriteFile(*dumpOutput, value.prefix, 0o600); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
 }
@@ -762,6 +846,7 @@ func listCommand(arguments []string) error {
 			return nil
 		},
 		nil,
+		nil,
 	)
 	if errors.Is(err, errStopWalk) {
 		return nil
@@ -801,6 +886,7 @@ func verifyCommand(arguments []string) error {
 			return nil
 		},
 		nil,
+		nil,
 	)
 	if err != nil {
 		return err
@@ -808,6 +894,111 @@ func verifyCommand(arguments []string) error {
 	fmt.Printf("base snapshot: valid\n")
 	fmt.Printf("volumes: 1-%d\n", endVolume+1)
 	fmt.Printf("entries: %d (%d files, %d directories)\n", entries, files, directories)
+	return nil
+}
+
+func firstVolumeTag(candidate volume) (byte, error) {
+	file, err := os.Open(candidate.path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	if _, err := file.Seek(legacyHeaderSize, io.SeekStart); err != nil {
+		return 0, err
+	}
+	var value [1]byte
+	if _, err := io.ReadFull(file, value[:]); err != nil {
+		return 0, err
+	}
+	return value[0], nil
+}
+
+func nextSnapshotStart(volumes []volume, start int) (int, bool, error) {
+	for index := start; index < len(volumes); index++ {
+		tag, err := firstVolumeTag(volumes[index])
+		if err != nil {
+			return 0, false, err
+		}
+		if tag == 0x66 {
+			return index, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func snapshotsCommand(arguments []string) error {
+	flags := flag.NewFlagSet("snapshots", flag.ContinueOnError)
+	maxOutput := flags.Int64("max-output", 64<<30, "maximum decompressed bytes per field")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: tib-recover snapshots [OPTIONS] VOLUME.tib")
+	}
+
+	volumes, err := discoverVolumes(flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	knownEntries := make(map[string]snapshotEntry)
+
+	walk := func(snapshot int, start int) (int, error) {
+		var entries, files, directories int
+		end, err := walkSnapshot(
+			volumes,
+			start,
+			*maxOutput,
+			func(entry snapshotEntry) error {
+				entries++
+				switch entry.kind {
+				case 0:
+					files++
+				case 1:
+					directories++
+				}
+				knownEntries[entryKey(entry.components)] = entry
+				return nil
+			},
+			nil,
+			knownEntries,
+		)
+		if err != nil {
+			return end, err
+		}
+		label := "incremental"
+		if snapshot == 0 {
+			label = "base"
+		}
+		fmt.Printf(
+			"snapshot %d (%s): volumes %d-%d, entries %d (%d files, %d directories)\n",
+			snapshot,
+			label,
+			start+1,
+			end+1,
+			entries,
+			files,
+			directories,
+		)
+		return end, nil
+	}
+
+	end, err := walk(0, 0)
+	if err != nil {
+		return err
+	}
+	for snapshot := 1; ; snapshot++ {
+		start, ok, err := nextSnapshotStart(volumes, end+1)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		end, err = walk(snapshot, start)
+		if err != nil {
+			return fmt.Errorf("snapshot %d starting in volume %d: %w", snapshot, start+1, err)
+		}
+	}
 	return nil
 }
 
@@ -969,6 +1160,7 @@ func extractCommand(arguments []string) error {
 			}
 			return target, nil
 		},
+		nil,
 	)
 	if errors.Is(err, errStopWalk) {
 		err = nil
@@ -983,6 +1175,7 @@ func usage() {
   tib-recover records [--limit N] [--max-output BYTES] VOLUME.tib
   tib-recover list [--limit N] VOLUME.tib
   tib-recover verify VOLUME.tib
+  tib-recover snapshots VOLUME.tib
   tib-recover extract --destination DIR [--match TEXT] [--max-files N] VOLUME.tib
 
 All commands are read-only. Legacy TIB support is experimental.`)
@@ -1002,6 +1195,8 @@ func run(arguments []string) error {
 		return listCommand(arguments[1:])
 	case "verify":
 		return verifyCommand(arguments[1:])
+	case "snapshots":
+		return snapshotsCommand(arguments[1:])
 	case "extract":
 		return extractCommand(arguments[1:])
 	case "-h", "--help", "help":

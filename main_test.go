@@ -7,6 +7,7 @@ import (
 	"hash/adler32"
 	"io"
 	"path/filepath"
+	"slices"
 	"testing"
 	"unicode/utf16"
 )
@@ -96,6 +97,47 @@ func TestSafeExtractionPathRejectsTraversal(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected traversal error")
+	}
+}
+
+func TestResolveInheritedPath(t *testing.T) {
+	entry := snapshotEntry{
+		components: []string{`C:\`, "Users", "Simon", "Documents", "notes.txt"},
+		kind:       0,
+	}
+	known := map[string]snapshotEntry{entryKey(entry.components): entry}
+
+	resolved, err := resolveInheritedPath(
+		[]string{`C:\`, "Users", "Simon"},
+		pathField{name: "notes.txt", kind: 0, depth: 4},
+		known,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{`C:\`, "Users", "Simon", "Documents"}
+	if !slices.Equal(resolved, expected) {
+		t.Fatalf("resolved = %#v, expected %#v", resolved, expected)
+	}
+}
+
+func TestResolveInheritedPathRejectsAmbiguousParent(t *testing.T) {
+	known := make(map[string]snapshotEntry)
+	for _, name := range []string{"one", "two"} {
+		entry := snapshotEntry{
+			components: []string{`C:\`, "Users", "Simon", name},
+			kind:       1,
+		}
+		known[entryKey(entry.components)] = entry
+	}
+
+	_, err := resolveInheritedPath(
+		[]string{`C:\`, "Users", "Simon"},
+		pathField{name: "new.txt", kind: 0, depth: 4},
+		known,
+	)
+	if err == nil {
+		t.Fatal("expected ambiguous inherited parent error")
 	}
 }
 

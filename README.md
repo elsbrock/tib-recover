@@ -19,6 +19,7 @@ tib-recover inspect daten1.tib
 tib-recover records --limit 100 daten1.tib
 tib-recover list --limit 100 daten1.tib
 tib-recover verify daten1.tib
+tib-recover snapshots daten1.tib
 tib-recover extract --destination recovered daten1.tib
 tib-recover extract --destination recovered-one \
   --match IMGP1772.JPG --max-files 1 daten1.tib
@@ -26,8 +27,14 @@ tib-recover extract --destination recovered-one \
 
 `inspect` discovers and validates numbered volumes in the same directory.
 `records` decodes the tagged raw-DEFLATE fields in one volume and recognizes
-UTF-16 path records. `verify` streams the complete base snapshot, including
-fields split across volume boundaries, and checks every stored CRC.
+UTF-16 path records. Its `--dump-field` option can stream a complete decoded
+field to disk for format analysis. `verify` streams the complete base snapshot,
+including fields split across volume boundaries, and checks every stored CRC.
+
+`snapshots` is the incremental-format workbench. It discovers slice starts,
+streams split slices, verifies their checksums, and resolves omitted ancestor
+paths against entries known from preceding snapshots. Resolution deliberately
+stops when a newly added item has more than one possible inherited parent.
 
 `extract` currently recovers the complete base snapshot. It:
 
@@ -44,11 +51,12 @@ Volume discovery, legacy headers, field framing, cross-volume decompression,
 checksums, path reconstruction, base-snapshot verification, and safe payload
 extraction are implemented.
 
-Incremental snapshots are recognized as separate slices but are not replayed
-yet. Later slices can begin in the middle of an inherited path and may encode
-deletions and renames. Until those semantics are decoded, `extract` deliberately
-recovers only the internally complete base snapshot rather than constructing a
-plausible but potentially incorrect latest state.
+Incremental snapshot verification and inherited-path reconstruction are in
+progress. Later slices can begin in the middle of an inherited path, omit
+unchanged ancestors, and may encode deletions and renames. Until those semantics
+are decoded, `extract` deliberately recovers only the internally complete base
+snapshot rather than constructing a plausible but potentially incorrect latest
+state.
 
 Do not use the tool as the only copy of valuable data. Work from a verified disk
 image and keep the original archive unchanged.
