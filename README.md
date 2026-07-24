@@ -81,9 +81,23 @@ checksums, catalog decoding, incremental tree reconstruction, incomplete-tail
 detection, and safe base/latest payload extraction are implemented for the
 legacy file-level format exercised by this archive.
 
-Only the default NTFS data stream is restored. Alternate data streams, ACLs,
-Windows attributes, and sparse-file layout are parsed or skipped as metadata but
-are not recreated on the destination filesystem.
+## Unsupported and unverified
+
+- Other TIB generations, newer container layouts, and `.tibx` archives are not
+  supported. Compatibility is only established for the exact legacy,
+  file-level variant exercised by the real recovery archive and synthetic
+  tests.
+- Disk- or partition-image backups, encrypted or password-protected archives,
+  and compression or framing other than the observed raw-DEFLATE fields are not
+  supported.
+- Only regular files and directories are restored. NTFS alternate data streams,
+  ACLs, Windows attributes, sparse layout, hard links, and reparse-point or
+  symlink semantics are not recreated.
+- Complete snapshots can be listed, but extraction currently selects only the
+  base or newest complete snapshot—not an arbitrary intermediate snapshot.
+- Extraction requires an empty destination, does not overwrite or resume files,
+  and stops on corruption. The only tolerated damage is an incomplete trailing
+  snapshot when an earlier complete catalog remains recoverable.
 
 Do not use the tool as the only copy of valuable data. Work from a verified disk
 image and keep the original archive unchanged.
