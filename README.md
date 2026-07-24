@@ -68,3 +68,22 @@ are not recreated on the destination filesystem.
 
 Do not use the tool as the only copy of valuable data. Work from a verified disk
 image and keep the original archive unchanged.
+
+## Provenance and related work
+
+The legacy format support in this repository was developed by examining a
+real archive, recording observed framing and metadata relationships, and
+testing recovery against that archive. No source code is copied or vendored
+from another TIB implementation.
+
+[dennisss/acronis-tib](https://github.com/dennisss/acronis-tib) is useful
+related prior art for other generations of the proprietary TIB family. It is a
+separate TypeScript project under the MIT license and is not a dependency of
+`tib-recover`.
+
+Acronis and True Image are trademarks of their respective owner. This project
+is independent and is not affiliated with or endorsed by Acronis.
+
+## License
+
+`tib-recover` is available under the [MIT License](LICENSE).

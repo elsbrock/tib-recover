@@ -1,5 +1,6 @@
 {
   buildGoModule,
+  lib,
 }:
 
 buildGoModule {
@@ -11,6 +12,7 @@ buildGoModule {
 
   meta = {
     description = "Read-only parser for legacy Acronis True Image TIB archives";
+    license = lib.licenses.mit;
     mainProgram = "tib-recover";
   };
 }
