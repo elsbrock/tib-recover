@@ -117,6 +117,11 @@ separate TypeScript project under the MIT license and is not a dependency of
 Acronis and True Image are trademarks of their respective owner. This project
 is independent and is not affiliated with or endorsed by Acronis.
 
+## Contributing
+
+Pull requests are welcome. Please keep changes focused and follow the testing
+and Conventional Commit guidance in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 `tib-recover` is available under the [MIT License](LICENSE).
