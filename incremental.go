@@ -124,6 +124,7 @@ func scanArchiveSection(
 	defer chain.Close()
 
 	reader := newCountingReader(chain, 0)
+	inflater := &reusableInflater{}
 	var paths []*rawPathRecord
 	var current *rawPathRecord
 	var catalog []byte
@@ -145,7 +146,19 @@ func scanArchiveSection(
 			output = capture
 		}
 
-		value, err := readFieldBody(reader, start, tag, outputLimit, output)
+		prefixLimit := 0
+		if tag == 0x66 {
+			prefixLimit = maxFieldPrefix
+		}
+		value, err := readFieldBodyReusable(
+			reader,
+			start,
+			tag,
+			outputLimit,
+			output,
+			inflater,
+			prefixLimit,
+		)
 		if err != nil {
 			context := ""
 			if current != nil {
@@ -339,7 +352,7 @@ func parseCatalog(data []byte, paths map[uint64]*rawPathRecord) ([]snapshotEntry
 }
 
 func decodeCatalogString(data []byte, offset int) (string, int, bool) {
-	if offset < 0 || offset+4 > len(data) {
+	if offset < 0 || offset > len(data)-4 {
 		return "", offset, false
 	}
 	length := binary.LittleEndian.Uint32(data[offset:])
@@ -483,6 +496,7 @@ func extractSectionTargets(
 	defer chain.Close()
 
 	reader := newCountingReader(chain, 0)
+	inflater := &reusableInflater{}
 	var currentOffset uint64
 	var currentTarget *snapshotEntry
 
@@ -522,7 +536,15 @@ func extractSectionTargets(
 		if target != nil {
 			output = target.writer
 		}
-		value, err := readFieldBody(reader, start, tag, outputLimit, output)
+		value, err := readFieldBodyReusable(
+			reader,
+			start,
+			tag,
+			outputLimit,
+			output,
+			inflater,
+			0,
+		)
 		if err != nil {
 			if target != nil {
 				target.abort()

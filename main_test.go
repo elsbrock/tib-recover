@@ -12,7 +12,7 @@ import (
 	"unicode/utf16"
 )
 
-func encodeField(t *testing.T, tag byte, payload []byte) []byte {
+func encodeField(t testing.TB, tag byte, payload []byte) []byte {
 	t.Helper()
 	var output bytes.Buffer
 	output.WriteByte(tag)
