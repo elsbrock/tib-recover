@@ -32,7 +32,8 @@ tib-recover extract --destination recovered-one \
 `records` decodes the tagged raw-DEFLATE fields in one volume and recognizes
 UTF-16 path records. Its `--dump-field` option can stream a complete decoded
 field to disk for format analysis. `verify` streams the complete base snapshot,
-including fields split across volume boundaries, and checks every stored CRC.
+including fields split across volume boundaries, and checks every stored
+Adler-32 or CRC-32 checksum.
 
 `snapshots` discovers every complete catalog, streams split sections, verifies
 all field checksums, and reconstructs each full tree from the catalog's
@@ -47,7 +48,7 @@ deletions, and renames across the incremental chain. It:
 - reconstructs the Windows directory tree below a sanitized drive directory;
 - rejects absolute paths and traversal components;
 - strips the legacy Acronis file-content envelope;
-- checks both the field CRC and embedded original content length;
+- checks both the field checksum and embedded original content length;
 - restores file and directory timestamps from the selected catalog;
 - writes to a temporary file, syncs it, and atomically renames it;
 - refuses to overwrite an existing destination.
