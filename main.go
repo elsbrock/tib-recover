@@ -264,8 +264,10 @@ type pathField struct {
 }
 
 type snapshotEntry struct {
-	components []string
-	kind       byte
+	components   []string
+	kind         byte
+	timestamp    uint64
+	recordOffset uint64
 }
 
 func (entry snapshotEntry) String() string {
@@ -897,35 +899,6 @@ func verifyCommand(arguments []string) error {
 	return nil
 }
 
-func firstVolumeTag(candidate volume) (byte, error) {
-	file, err := os.Open(candidate.path)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-	if _, err := file.Seek(legacyHeaderSize, io.SeekStart); err != nil {
-		return 0, err
-	}
-	var value [1]byte
-	if _, err := io.ReadFull(file, value[:]); err != nil {
-		return 0, err
-	}
-	return value[0], nil
-}
-
-func nextSnapshotStart(volumes []volume, start int) (int, bool, error) {
-	for index := start; index < len(volumes); index++ {
-		tag, err := firstVolumeTag(volumes[index])
-		if err != nil {
-			return 0, false, err
-		}
-		if tag == 0x66 {
-			return index, true, nil
-		}
-	}
-	return 0, false, nil
-}
-
 func snapshotsCommand(arguments []string) error {
 	flags := flag.NewFlagSet("snapshots", flag.ContinueOnError)
 	maxOutput := flags.Int64("max-output", 64<<30, "maximum decompressed bytes per field")
@@ -940,64 +913,42 @@ func snapshotsCommand(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	knownEntries := make(map[string]snapshotEntry)
-
-	walk := func(snapshot int, start int) (int, error) {
-		var entries, files, directories int
-		end, err := walkSnapshot(
-			volumes,
-			start,
-			*maxOutput,
-			func(entry snapshotEntry) error {
-				entries++
-				switch entry.kind {
-				case 0:
-					files++
-				case 1:
-					directories++
-				}
-				knownEntries[entryKey(entry.components)] = entry
-				return nil
-			},
-			nil,
-			knownEntries,
-		)
-		if err != nil {
-			return end, err
-		}
-		label := "incremental"
-		if snapshot == 0 {
-			label = "base"
-		}
-		fmt.Printf(
-			"snapshot %d (%s): volumes %d-%d, entries %d (%d files, %d directories)\n",
-			snapshot,
-			label,
-			start+1,
-			end+1,
-			entries,
-			files,
-			directories,
-		)
-		return end, nil
-	}
-
-	end, err := walk(0, 0)
+	index, err := scanArchiveIndex(volumes, *maxOutput)
 	if err != nil {
 		return err
 	}
-	for snapshot := 1; ; snapshot++ {
-		start, ok, err := nextSnapshotStart(volumes, end+1)
-		if err != nil {
-			return err
+	for snapshotNumber, snapshot := range index.snapshots {
+		var files, directories int
+		for _, entry := range snapshot.entries {
+			switch entry.kind {
+			case 0:
+				files++
+			case 1:
+				directories++
+			}
 		}
-		if !ok {
-			break
+		section := index.sections[snapshot.section]
+		label := "incremental"
+		if snapshotNumber == 0 {
+			label = "base"
 		}
-		end, err = walk(snapshot, start)
-		if err != nil {
-			return fmt.Errorf("snapshot %d starting in volume %d: %w", snapshot, start+1, err)
-		}
+		fmt.Printf(
+			"snapshot %d (%s): catalog volume %d, entries %d (%d files, %d directories)\n",
+			snapshotNumber,
+			label,
+			section.endVolume+1,
+			len(snapshot.entries),
+			files,
+			directories,
+		)
+	}
+	if index.incompleteError != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"incomplete trailing snapshot starting in volume %d: %v\n",
+			index.incompleteStartVolume+1,
+			index.incompleteError,
+		)
 	}
 	return nil
 }
@@ -1088,6 +1039,7 @@ func newFileTarget(path string) (*payloadTarget, error) {
 func extractCommand(arguments []string) error {
 	flags := flag.NewFlagSet("extract", flag.ContinueOnError)
 	destination := flags.String("destination", "", "empty directory for recovered files")
+	snapshot := flags.String("snapshot", "base", "snapshot to extract: base or latest")
 	match := flags.String("match", "", "only extract paths containing this text")
 	maxFiles := flags.Int("max-files", 0, "stop after extracting this many files (0 means all)")
 	maxOutput := flags.Int64("max-output", 64<<30, "maximum decompressed bytes per field")
@@ -1105,27 +1057,38 @@ func extractCommand(arguments []string) error {
 		return err
 	}
 
-	destinationPath, err := filepath.Abs(*destination)
+	destinationPath, err := ensureEmptyDestination(*destination)
 	if err != nil {
 		return err
 	}
-	if info, err := os.Stat(destinationPath); err == nil {
-		if !info.IsDir() {
-			return fmt.Errorf("destination is not a directory: %s", destinationPath)
-		}
-		entries, err := os.ReadDir(destinationPath)
+	if *snapshot == "latest" {
+		index, err := scanArchiveIndex(volumes, *maxOutput)
 		if err != nil {
 			return err
 		}
-		if len(entries) != 0 {
-			return fmt.Errorf("destination must be empty: %s", destinationPath)
+		if index.incompleteError != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"warning: ignoring incomplete trailing snapshot starting in volume %d: %v\n",
+				index.incompleteStartVolume+1,
+				index.incompleteError,
+			)
 		}
-	} else if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(destinationPath, 0o700); err != nil {
-			return err
-		}
-	} else {
+		selected := latestCatalog(index)
+		extracted, err := extractCatalogSnapshot(
+			volumes,
+			index,
+			selected,
+			destinationPath,
+			*match,
+			*maxFiles,
+			*maxOutput,
+		)
+		fmt.Printf("extracted files: %d\n", extracted)
 		return err
+	}
+	if *snapshot != "base" {
+		return fmt.Errorf("unsupported snapshot %q: expected base or latest", *snapshot)
 	}
 
 	extracted := 0
@@ -1176,9 +1139,9 @@ func usage() {
   tib-recover list [--limit N] VOLUME.tib
   tib-recover verify VOLUME.tib
   tib-recover snapshots VOLUME.tib
-  tib-recover extract --destination DIR [--match TEXT] [--max-files N] VOLUME.tib
+  tib-recover extract --destination DIR [--snapshot base|latest] [--match TEXT] [--max-files N] VOLUME.tib
 
-All commands are read-only. Legacy TIB support is experimental.`)
+Archive volumes are always opened read-only. Legacy TIB support is experimental.`)
 }
 
 func run(arguments []string) error {

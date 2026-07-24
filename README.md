@@ -21,6 +21,7 @@ tib-recover list --limit 100 daten1.tib
 tib-recover verify daten1.tib
 tib-recover snapshots daten1.tib
 tib-recover extract --destination recovered daten1.tib
+tib-recover extract --snapshot latest --destination recovered-latest daten1.tib
 tib-recover extract --destination recovered-one \
   --match IMGP1772.JPG --max-files 1 daten1.tib
 ```
@@ -31,32 +32,39 @@ UTF-16 path records. Its `--dump-field` option can stream a complete decoded
 field to disk for format analysis. `verify` streams the complete base snapshot,
 including fields split across volume boundaries, and checks every stored CRC.
 
-`snapshots` is the incremental-format workbench. It discovers slice starts,
-streams split slices, verifies their checksums, and resolves omitted ancestor
-paths against entries known from preceding snapshots. Resolution deliberately
-stops when a newly added item has more than one possible inherited parent.
+`snapshots` discovers every complete catalog, streams split sections, verifies
+all field checksums, and reconstructs each full tree from the catalog's
+post-order records. Catalog entries reference the exact historical path record
+that owns their payload, so unchanged files do not need to be copied into every
+increment.
 
-`extract` currently recovers the complete base snapshot. It:
+`extract` defaults to the complete base snapshot. Pass `--snapshot latest` to
+recover the newest complete catalog, replaying additions, modifications,
+deletions, and renames across the incremental chain. It:
 
 - reconstructs the Windows directory tree below a sanitized drive directory;
 - rejects absolute paths and traversal components;
 - strips the legacy Acronis file-content envelope;
 - checks both the field CRC and embedded original content length;
+- restores file and directory timestamps from the selected catalog;
 - writes to a temporary file, syncs it, and atomically renames it;
 - refuses to overwrite an existing destination.
+
+If the archive ends during an unfinished backup, `snapshots` reports the
+trailing incomplete section and `--snapshot latest` selects the preceding
+complete catalog. It never constructs a tree from a snapshot that has no
+closing catalog.
 
 ## Status
 
 Volume discovery, legacy headers, field framing, cross-volume decompression,
-checksums, path reconstruction, base-snapshot verification, and safe payload
-extraction are implemented.
+checksums, catalog decoding, incremental tree reconstruction, incomplete-tail
+detection, and safe base/latest payload extraction are implemented for the
+legacy file-level format exercised by this archive.
 
-Incremental snapshot verification and inherited-path reconstruction are in
-progress. Later slices can begin in the middle of an inherited path, omit
-unchanged ancestors, and may encode deletions and renames. Until those semantics
-are decoded, `extract` deliberately recovers only the internally complete base
-snapshot rather than constructing a plausible but potentially incorrect latest
-state.
+Only the default NTFS data stream is restored. Alternate data streams, ACLs,
+Windows attributes, and sparse-file layout are parsed or skipped as metadata but
+are not recreated on the destination filesystem.
 
 Do not use the tool as the only copy of valuable data. Work from a verified disk
 image and keep the original archive unchanged.
