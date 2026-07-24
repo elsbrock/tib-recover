@@ -90,7 +90,7 @@ func TestParseCatalogRejectsUnknownRecordOffset(t *testing.T) {
 }
 
 func appendPathWithContent(
-	t *testing.T,
+	t testing.TB,
 	section []byte,
 	logicalStart uint64,
 	name string,
@@ -132,7 +132,7 @@ func encodeCatalog(records ...catalogTestRecord) []byte {
 	return data
 }
 
-func writeTestVolume(t *testing.T, path string, sequence uint32, section, trailer []byte) {
+func writeTestVolume(t testing.TB, path string, sequence uint32, section, trailer []byte) {
 	t.Helper()
 	header := make([]byte, legacyHeaderSize)
 	copy(header, legacyMagic[:])

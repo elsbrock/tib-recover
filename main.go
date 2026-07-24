@@ -194,6 +194,28 @@ type field struct {
 	prefix           []byte
 }
 
+type reusableInflater struct {
+	reader     io.ReadCloser
+	resetter   flate.Resetter
+	copyBuffer []byte
+}
+
+func (inflater *reusableInflater) reset(input io.Reader) (io.ReadCloser, error) {
+	if inflater.reader == nil {
+		inflater.reader = flate.NewReader(input)
+		resetter, ok := inflater.reader.(flate.Resetter)
+		if !ok {
+			return nil, errors.New("DEFLATE reader does not support reset")
+		}
+		inflater.resetter = resetter
+		return inflater.reader, nil
+	}
+	if err := inflater.resetter.Reset(input, nil); err != nil {
+		return nil, err
+	}
+	return inflater.reader, nil
+}
+
 func readField(reader *countingReader, outputLimit int64) (field, error) {
 	start := reader.offset
 	tag, err := reader.ReadByte()
@@ -210,17 +232,60 @@ func readFieldBody(
 	outputLimit int64,
 	output io.Writer,
 ) (field, error) {
+	return readFieldBodyReusable(
+		reader,
+		start,
+		tag,
+		outputLimit,
+		output,
+		nil,
+		maxFieldPrefix,
+	)
+}
+
+func readFieldBodyReusable(
+	reader *countingReader,
+	start int64,
+	tag byte,
+	outputLimit int64,
+	output io.Writer,
+	reusable *reusableInflater,
+	prefixLimit int,
+) (field, error) {
 	compressedStart := reader.offset
-	inflater := flate.NewReader(reader)
-	prefix := &prefixWriter{limit: maxFieldPrefix}
+	var inflater io.ReadCloser
+	var err error
+	if reusable == nil {
+		inflater = flate.NewReader(reader)
+	} else {
+		inflater, err = reusable.reset(reader)
+		if err != nil {
+			return field{}, fmt.Errorf("reset inflater at %#x: %w", start, err)
+		}
+	}
+	prefix := &prefixWriter{limit: prefixLimit}
 	adler := adler32.New()
 	crc := crc32.NewIEEE()
-	writers := []io.Writer{prefix, adler, crc}
+	writers := []io.Writer{adler, crc}
+	if prefixLimit > 0 {
+		writers = append(writers, prefix)
+	}
 	if output != nil {
 		writers = append(writers, output)
 	}
 
-	written, copyErr := io.Copy(io.MultiWriter(writers...), io.LimitReader(inflater, outputLimit+1))
+	destination := io.MultiWriter(writers...)
+	source := io.LimitReader(inflater, outputLimit+1)
+	var written int64
+	var copyErr error
+	if reusable == nil {
+		written, copyErr = io.Copy(destination, source)
+	} else {
+		if reusable.copyBuffer == nil {
+			reusable.copyBuffer = make([]byte, 32*1024)
+		}
+		written, copyErr = io.CopyBuffer(destination, source, reusable.copyBuffer)
+	}
 	closeErr := inflater.Close()
 	if copyErr != nil {
 		return field{}, fmt.Errorf("inflate field at %#x: %w", start, copyErr)
@@ -402,6 +467,7 @@ func walkSnapshot(
 	defer chain.Close()
 
 	reader := newCountingReader(chain, 0)
+	inflater := &reusableInflater{}
 	var components []string
 	var current snapshotEntry
 
@@ -424,7 +490,19 @@ func walkSnapshot(
 		if target != nil {
 			output = target.writer
 		}
-		value, err := readFieldBody(reader, start, tag, outputLimit, output)
+		prefixLimit := 0
+		if tag == 0x66 {
+			prefixLimit = maxFieldPrefix
+		}
+		value, err := readFieldBodyReusable(
+			reader,
+			start,
+			tag,
+			outputLimit,
+			output,
+			inflater,
+			prefixLimit,
+		)
 		if err != nil {
 			if target != nil {
 				target.abort()
@@ -729,6 +807,7 @@ func recordsCommand(arguments []string) error {
 	}
 
 	reader := newCountingReader(file, legacyHeaderSize)
+	inflater := &reusableInflater{}
 	fmt.Printf("volume=%d path=%s\n", candidate.sequence, candidate.path)
 	for index := 0; index < *limit; index++ {
 		start := reader.offset
@@ -754,7 +833,15 @@ func recordsCommand(arguments []string) error {
 		if dumpFile != nil {
 			dumpWriter = dumpFile
 		}
-		value, readErr := readFieldBody(reader, start, tag, *maxOutput, dumpWriter)
+		value, readErr := readFieldBodyReusable(
+			reader,
+			start,
+			tag,
+			*maxOutput,
+			dumpWriter,
+			inflater,
+			maxFieldPrefix,
+		)
 		if dumpFile != nil {
 			if closeErr := dumpFile.Close(); readErr == nil {
 				readErr = closeErr
@@ -902,6 +989,7 @@ func verifyCommand(arguments []string) error {
 func snapshotsCommand(arguments []string) error {
 	flags := flag.NewFlagSet("snapshots", flag.ContinueOnError)
 	maxOutput := flags.Int64("max-output", 64<<30, "maximum decompressed bytes per field")
+	indexCache := flags.String("index-cache", "", "validated index cache path")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -913,9 +1001,16 @@ func snapshotsCommand(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	index, err := scanArchiveIndex(volumes, *maxOutput)
+	index, cacheHit, err := loadOrScanArchiveIndex(volumes, *maxOutput, *indexCache)
 	if err != nil {
 		return err
+	}
+	if *indexCache != "" {
+		action := "saved"
+		if cacheHit {
+			action = "loaded"
+		}
+		fmt.Fprintf(os.Stderr, "index cache: %s %s\n", action, *indexCache)
 	}
 	for snapshotNumber, snapshot := range index.snapshots {
 		var files, directories int
@@ -1043,6 +1138,7 @@ func extractCommand(arguments []string) error {
 	match := flags.String("match", "", "only extract paths containing this text")
 	maxFiles := flags.Int("max-files", 0, "stop after extracting this many files (0 means all)")
 	maxOutput := flags.Int64("max-output", 64<<30, "maximum decompressed bytes per field")
+	indexCache := flags.String("index-cache", "", "validated index cache path for latest snapshot")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -1062,9 +1158,16 @@ func extractCommand(arguments []string) error {
 		return err
 	}
 	if *snapshot == "latest" {
-		index, err := scanArchiveIndex(volumes, *maxOutput)
+		index, cacheHit, err := loadOrScanArchiveIndex(volumes, *maxOutput, *indexCache)
 		if err != nil {
 			return err
+		}
+		if *indexCache != "" {
+			action := "saved"
+			if cacheHit {
+				action = "loaded"
+			}
+			fmt.Fprintf(os.Stderr, "index cache: %s %s\n", action, *indexCache)
 		}
 		if index.incompleteError != nil {
 			fmt.Fprintf(
@@ -1138,8 +1241,8 @@ func usage() {
   tib-recover records [--limit N] [--max-output BYTES] VOLUME.tib
   tib-recover list [--limit N] VOLUME.tib
   tib-recover verify VOLUME.tib
-  tib-recover snapshots VOLUME.tib
-  tib-recover extract --destination DIR [--snapshot base|latest] [--match TEXT] [--max-files N] VOLUME.tib
+  tib-recover snapshots [--index-cache PATH] VOLUME.tib
+  tib-recover extract --destination DIR [--snapshot base|latest] [--index-cache PATH] [--match TEXT] [--max-files N] VOLUME.tib
 
 Archive volumes are always opened read-only. Legacy TIB support is experimental.`)
 }

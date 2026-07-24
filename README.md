@@ -20,8 +20,10 @@ tib-recover records --limit 100 daten1.tib
 tib-recover list --limit 100 daten1.tib
 tib-recover verify daten1.tib
 tib-recover snapshots daten1.tib
+tib-recover snapshots --index-cache daten.index.json daten1.tib
 tib-recover extract --destination recovered daten1.tib
-tib-recover extract --snapshot latest --destination recovered-latest daten1.tib
+tib-recover extract --snapshot latest --index-cache daten.index.json \
+  --destination recovered-latest daten1.tib
 tib-recover extract --destination recovered-one \
   --match IMGP1772.JPG --max-files 1 daten1.tib
 ```
@@ -54,6 +56,22 @@ If the archive ends during an unfinished backup, `snapshots` reports the
 trailing incomplete section and `--snapshot latest` selects the preceding
 complete catalog. It never constructs a tree from a snapshot that has no
 closing catalog.
+
+### Reusing a validated index
+
+Scanning a large incremental chain requires inflating and checksumming every
+field. Pass `--index-cache PATH` to `snapshots` or a latest-snapshot extraction
+to save that result and reuse it on later runs. The initial run still performs
+the complete scan. A cache hit verifies the volume names, sequence numbers,
+sizes, modification times, and SHA-256 hashes of the first and last 64 KiB of
+each volume before accepting the cached section and catalog metadata. Cached
+paths and logical offsets are validated again when loaded, and every extracted
+payload still has its archive checksum checked.
+
+The cache is a trusted local derivative of the archive, contains archived
+filenames and timestamps, and is created with mode `0600`. Keep it outside the
+archive directory if that directory should remain read-only. Delete the cache
+to force a complete rescan.
 
 ## Status
 
